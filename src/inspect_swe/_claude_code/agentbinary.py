@@ -1,13 +1,14 @@
 import re
 from pathlib import Path
 
+from inspect_ai.util import SandboxEnvironment
 from pydantic import BaseModel
 from typing_extensions import Literal
 
 from .._util.agentbinary import AgentBinarySource, AgentBinaryVersion
 from .._util.appdirs import package_cache_dir
 from .._util.download import download_text_file
-from .._util.sandbox import SandboxPlatform
+from .._util.sandbox import SandboxPlatform, bash_command
 
 
 def claude_code_binary_source() -> AgentBinarySource:
@@ -37,6 +38,33 @@ def claude_code_binary_source() -> AgentBinarySource:
         list_cached_binaries=list_cached_binaries,
         post_download=None,
         post_install=None,
+    )
+
+
+async def claude_code_supports_system_prompt_files(
+    sandbox: SandboxEnvironment, binary: str, user: str | None = None
+) -> bool:
+    """Whether an installed claude code accepts the --*-system-prompt-file flags.
+
+    Detected from ``claude --help`` rather than gated on a version number:
+    ``version="auto"`` and ``version="sandbox"`` run whatever binary is already
+    in the sandbox, so its version isn't always knowable, and detection also
+    holds for forks and backports. Returns ``False`` when ``--help`` can't be
+    run, which keeps the prompt on the command line as before.
+
+    ``--help`` currently spells the flags as an aside on ``--append-system-prompt``
+    (``--append-system-prompt[-file]``) rather than listing them, so match either
+    that or the bare flag.
+    """
+    result = await sandbox.exec(bash_command(f"{binary} --help"), user=user)
+    if not result.success:
+        return False
+    return any(
+        spelling in result.stdout
+        for spelling in (
+            "--append-system-prompt-file",
+            "--append-system-prompt[-file]",
+        )
     )
 
 
