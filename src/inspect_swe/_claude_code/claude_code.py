@@ -45,14 +45,22 @@ from inspect_swe._util.websearch import web_search_tool_disallowed
 from .._util._async import is_callable_coroutine
 from .._util.agentbinary import ensure_agent_binary_installed
 from .._util.messages import build_user_prompt
-from .._util.sandbox import resolve_agent_cwd
+from .._util.sandbox import resolve_agent_cwd, sandbox_exec
 from .._util.trace import trace
-from .agentbinary import claude_code_binary_source
+from .agentbinary import (
+    claude_code_binary_source,
+    claude_code_supports_system_prompt_files,
+)
 from .model import resolve_claude_code_models
 
 ClaudeCodePermissionMode = Literal[
     "acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"
 ]
+
+SYSTEM_PROMPT_FILE_FLAGS = {
+    "--system-prompt": "--system-prompt-file",
+    "--append-system-prompt": "--append-system-prompt-file",
+}
 
 
 class ClaudeCodeDeprecatedArgs(TypedDict, total=False):
@@ -346,6 +354,16 @@ def claude_code(
             # resolve working directory (home dir if sandbox default is '/')
             agent_cwd = await resolve_agent_cwd(sbox, user, cwd)
 
+            # system prompts go in files rather than argv where the installed
+            # claude supports it (see _write_system_prompt_files)
+            system_prompt_dir = (
+                await sandbox_exec(sbox, "mktemp -d", user=user)
+                if await claude_code_supports_system_prompt_files(
+                    sbox, claude_binary, user
+                )
+                else None
+            )
+
             # install skills
             if resolved_skills is not None:
                 skills_dir = join_path(agent_cwd, ".claude/skills")
@@ -415,6 +433,14 @@ def claude_code(
                             replace_system_prompt,
                             is_resume=is_resume,
                         )
+                        system_prompt_files: list[str] = []
+                        if system_prompt_dir is not None:
+                            (
+                                system_args,
+                                system_prompt_files,
+                            ) = await _write_system_prompt_files(
+                                sbox, system_args, user, system_prompt_dir
+                            )
 
                         # resume previous conversation
                         if is_resume:
@@ -474,6 +500,11 @@ def claude_code(
                                     cc_debug.stderr.append(cc_event.data)
                             elif isinstance(cc_event, ExitEvent):
                                 exit_code = cc_event.code
+
+                        # the prompts have been read by now (the process has
+                        # exited) and they are the full system prompt, so don't
+                        # leave them sitting in the sandbox
+                        await _remove_system_prompt_files(sbox, system_prompt_files)
 
                         if debug:
                             debug_output.append(stderr_data)
@@ -569,6 +600,39 @@ def _system_prompt_args(
         args.extend(["--append-system-prompt", "\n\n".join(system_texts)])
 
     return args
+
+
+async def _write_system_prompt_files(
+    sbox: Any,
+    system_args: list[str],
+    user: str | None,
+    dir: str,
+) -> tuple[list[str], list[str]]:
+    """Move system prompt text out of argv and into files in the sandbox.
+
+    Returns the rewritten args alongside the paths written, which the caller
+    removes once the agent process has exited.
+    """
+    args: list[str] = []
+    paths: list[str] = []
+    for index in range(0, len(system_args), 2):
+        flag, text = system_args[index], system_args[index + 1]
+        path = join_path(dir, f"{uuid.uuid4().hex}.txt")
+        await sbox.write_file(path, text)
+        restrict = f"chmod 600 {shlex.quote(path)}"
+        if user is not None:
+            restrict = f"{restrict} && chown {shlex.quote(user)} {shlex.quote(path)}"
+        await sandbox_exec(sbox, restrict)
+        args.extend([SYSTEM_PROMPT_FILE_FLAGS[flag], path])
+        paths.append(path)
+
+    return args, paths
+
+
+async def _remove_system_prompt_files(sbox: Any, paths: list[str]) -> None:
+    if paths:
+        quoted = " ".join(shlex.quote(path) for path in paths)
+        await sandbox_exec(sbox, f"rm -f {quoted}")
 
 
 async def _seed_claude_config(
