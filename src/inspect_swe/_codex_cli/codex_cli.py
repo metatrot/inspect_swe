@@ -13,13 +13,19 @@ from inspect_ai.agent import (
     agent_with,
     sandbox_agent_bridge,
 )
+from inspect_ai.agent._bridge.util import _is_model_filter
 from inspect_ai.model import (
+    ChatMessage,
     ChatMessageSystem,
+    GenerateConfig,
     GenerateFilter,
+    GenerateInput,
     Model,
     ModelName,
+    ModelOutput,
     get_model,
 )
+from inspect_ai.tool import ToolChoice, ToolInfo
 from inspect_ai.scorer import score
 from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.util import SandboxEnvironment, checkpointer, store
@@ -180,6 +186,37 @@ def codex_cli(
         # --json parsing); see consumer.py.
         consumer = CodexConsumer()
 
+        # Codex refuses a task that arrives only as an AGENTS.md file: measured
+        # 2026-08-13, 1/13 runs acted with the file alone, 13/15 with the same
+        # text also in the system message the bridge serves.
+        agent_instructions: list[str | None] = [None]
+
+        async def system_prompt_channel(
+            model: Model,
+            input: list[ChatMessage],
+            tools: list[ToolInfo],
+            tool_choice: ToolChoice | None,
+            config: GenerateConfig,
+        ) -> ModelOutput | GenerateInput | None:
+            instructions = agent_instructions[0]
+            if instructions is None:
+                raise RuntimeError(
+                    "codex_cli: bridged generation reached the model before the "
+                    "agent instructions were resolved -- the system prompt would "
+                    "have been silently dropped from this request"
+                )
+            if instructions:
+                for message in input:
+                    if isinstance(message, ChatMessageSystem):
+                        if instructions not in message.text:
+                            message.content = f"{message.text}\n\n{instructions}"
+                        break
+            if filter is None:
+                return None
+            if _is_model_filter(filter):
+                return await filter(model, input, tools, tool_choice, config)
+            return await filter(model.name, input, tools, tool_choice, config)
+
         async with (
             checkpointer() as cp,
             sandbox_agent_bridge(
@@ -188,7 +225,7 @@ def codex_cli(
                 model_aliases=resolve_codex_auto_review_model_aliases(
                     resolved_auto_review, model_aliases
                 ),
-                filter=filter,
+                filter=system_prompt_channel,
                 sandbox=sandbox,
                 retry_refusals=retry_refusals,
                 port=port,
@@ -263,8 +300,9 @@ def codex_cli(
                     return join_path(dir, CONFIG_TOML)
 
             # write system messages to AGENTS.md
+            agent_instructions[0] = "\n\n".join(system_messages)
             if system_messages:
-                await sbox.write_file(codex_agents_md(), "\n\n".join(system_messages))
+                await sbox.write_file(codex_agents_md(), agent_instructions[0])
 
             # install skills
             if resolved_skills is not None:
