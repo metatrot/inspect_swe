@@ -1,7 +1,6 @@
 import asyncio
 import subprocess
 from pathlib import Path
-from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -44,21 +43,6 @@ def fake_claude(tmp_path: Path, script: str) -> str:
     binary.write_text(f"#!/bin/sh\n{script}\n")
     binary.chmod(0o755)
     return str(binary)
-
-
-class RecordingSandbox:
-    """Minimal sandbox stand-in that records writes and shell commands."""
-
-    async def write_file(self, file: str, contents: str) -> None:
-        self.files[file] = contents
-
-    def __init__(self) -> None:
-        self.files: dict[str, str] = {}
-        self.execs: list[str] = []
-
-    async def exec(self, cmd: list[str], **kwargs: object) -> object:
-        self.execs.append(cmd[-1])
-        return SimpleNamespace(success=True, stdout="", stderr="", returncode=0)
 
 
 def test_system_prompt_appends_to_default() -> None:
@@ -182,14 +166,13 @@ def test_system_prompt_files_unsupported_below_2_0_33(tmp_path: Path) -> None:
     )
 
 
-def test_system_prompt_files_keep_the_prompt_out_of_argv() -> None:
-    sbox = RecordingSandbox()
+def test_system_prompt_files_keep_the_prompt_out_of_argv(tmp_path: Path) -> None:
     args, paths = asyncio.run(
         _write_system_prompt_files(
-            sbox,
+            LocalSandbox(),
             _system_prompt_args(["Task prompt"], "Replacement prompt", is_resume=False),
             None,
-            "/tmp/prompts",
+            str(tmp_path),
         )
     )
 
@@ -198,42 +181,54 @@ def test_system_prompt_files_keep_the_prompt_out_of_argv() -> None:
     assert [args[1], args[3]] == paths
     assert "Task prompt" not in "\0".join(args)
     assert "Replacement prompt" not in "\0".join(args)
-    assert sbox.files[paths[0]] == "Replacement prompt"
-    assert sbox.files[paths[1]] == "Task prompt"
+    assert Path(paths[0]).read_text() == "Replacement prompt"
+    assert Path(paths[1]).read_text() == "Task prompt"
 
 
-def test_system_prompt_files_are_not_world_readable() -> None:
-    sbox = RecordingSandbox()
+def test_system_prompt_files_are_written_as_the_agent_user(tmp_path: Path) -> None:
+    sbox = LocalSandbox()
     _, paths = asyncio.run(
         _write_system_prompt_files(
-            sbox, ["--append-system-prompt", "Task prompt"], "agent", "/tmp/prompts"
+            sbox, ["--append-system-prompt", "Task prompt"], "agent", str(tmp_path)
         )
     )
 
-    assert f"chmod 600 {paths[0]}" in sbox.execs[0]
-    assert f"chown agent {paths[0]}" in sbox.execs[0]
+    assert sbox.users == ["agent"]
+    assert Path(paths[0]).read_text() == "Task prompt"
 
 
-def test_system_prompt_files_are_removed_after_the_agent_exits() -> None:
-    sbox = RecordingSandbox()
+def test_system_prompt_file_write_failure_raises(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="Error writing system prompt"):
+        asyncio.run(
+            _write_system_prompt_files(
+                LocalSandbox(),
+                ["--append-system-prompt", "Task prompt"],
+                None,
+                str(tmp_path / "missing"),
+            )
+        )
+
+
+def test_system_prompt_files_are_removed_after_the_agent_exits(
+    tmp_path: Path,
+) -> None:
+    sbox = LocalSandbox()
     _, paths = asyncio.run(
         _write_system_prompt_files(
-            sbox, ["--append-system-prompt", "Task prompt"], None, "/tmp/prompts"
+            sbox, ["--append-system-prompt", "Task prompt"], None, str(tmp_path)
         )
     )
     asyncio.run(_remove_system_prompt_files(sbox, paths))
 
-    assert f"rm -f {paths[0]}" in sbox.execs[-1]
+    assert not Path(paths[0]).exists()
 
 
-def test_no_system_prompt_writes_no_files() -> None:
-    sbox = RecordingSandbox()
-    args, paths = asyncio.run(
-        _write_system_prompt_files(sbox, [], None, "/tmp/prompts")
-    )
+def test_no_system_prompt_writes_no_files(tmp_path: Path) -> None:
+    sbox = LocalSandbox()
+    args, paths = asyncio.run(_write_system_prompt_files(sbox, [], None, str(tmp_path)))
 
     assert args == []
     assert paths == []
-    assert sbox.files == {}
+    assert list(tmp_path.iterdir()) == []
     asyncio.run(_remove_system_prompt_files(sbox, paths))
-    assert sbox.execs == []
+    assert sbox.users == []

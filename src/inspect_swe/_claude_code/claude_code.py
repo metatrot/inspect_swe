@@ -57,11 +57,6 @@ ClaudeCodePermissionMode = Literal[
     "acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"
 ]
 
-SYSTEM_PROMPT_FILE_FLAGS = {
-    "--system-prompt": "--system-prompt-file",
-    "--append-system-prompt": "--append-system-prompt-file",
-}
-
 
 class ClaudeCodeDeprecatedArgs(TypedDict, total=False):
     auto_mode: bool
@@ -606,24 +601,18 @@ async def _write_system_prompt_files(
     sbox: Any,
     system_args: list[str],
     user: str | None,
-    dir: str,
+    prompt_dir: str,
 ) -> tuple[list[str], list[str]]:
-    """Move system prompt text out of argv and into files in the sandbox.
-
-    Returns the rewritten args alongside the paths written, which the caller
-    removes once the agent process has exited.
-    """
     args: list[str] = []
     paths: list[str] = []
-    for index in range(0, len(system_args), 2):
-        flag, text = system_args[index], system_args[index + 1]
-        path = join_path(dir, f"{uuid.uuid4().hex}.txt")
-        await sbox.write_file(path, text)
-        restrict = f"chmod 600 {shlex.quote(path)}"
-        if user is not None:
-            restrict = f"{restrict} && chown {shlex.quote(user)} {shlex.quote(path)}"
-        await sandbox_exec(sbox, restrict)
-        args.extend([SYSTEM_PROMPT_FILE_FLAGS[flag], path])
+    for flag, text in zip(system_args[::2], system_args[1::2], strict=True):
+        path = join_path(prompt_dir, f"{uuid.uuid4().hex}.txt")
+        result = await sbox.exec(
+            ["bash", "-c", 'cat > "$1"', "bash", path], input=text, user=user
+        )
+        if not result.success:
+            raise RuntimeError(f"Error writing system prompt {path}: {result.stderr}")
+        args.extend([f"{flag}-file", path])
         paths.append(path)
 
     return args, paths
