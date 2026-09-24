@@ -11,9 +11,8 @@ from inspect_swe._claude_code.agentbinary import (
     claude_code_supports_system_prompt_files,
 )
 from inspect_swe._claude_code.claude_code import (
-    _remove_system_prompt_files,
     _system_prompt_args,
-    _write_system_prompt_files,
+    _system_prompt_file_args,
 )
 
 
@@ -167,8 +166,8 @@ def test_system_prompt_files_unsupported_below_2_0_33(tmp_path: Path) -> None:
 
 
 def test_system_prompt_files_keep_the_prompt_out_of_argv(tmp_path: Path) -> None:
-    args, paths = asyncio.run(
-        _write_system_prompt_files(
+    args = asyncio.run(
+        _system_prompt_file_args(
             LocalSandbox(),
             _system_prompt_args(["Task prompt"], "Replacement prompt", is_resume=False),
             None,
@@ -178,29 +177,29 @@ def test_system_prompt_files_keep_the_prompt_out_of_argv(tmp_path: Path) -> None
 
     assert args[0] == "--system-prompt-file"
     assert args[2] == "--append-system-prompt-file"
-    assert [args[1], args[3]] == paths
     assert "Task prompt" not in "\0".join(args)
     assert "Replacement prompt" not in "\0".join(args)
-    assert Path(paths[0]).read_text() == "Replacement prompt"
-    assert Path(paths[1]).read_text() == "Task prompt"
+    assert Path(args[1]).parent == tmp_path
+    assert Path(args[1]).read_text() == "Replacement prompt"
+    assert Path(args[3]).read_text() == "Task prompt"
 
 
 def test_system_prompt_files_are_written_as_the_agent_user(tmp_path: Path) -> None:
     sbox = LocalSandbox()
-    _, paths = asyncio.run(
-        _write_system_prompt_files(
+    args = asyncio.run(
+        _system_prompt_file_args(
             sbox, ["--append-system-prompt", "Task prompt"], "agent", str(tmp_path)
         )
     )
 
     assert sbox.users == ["agent"]
-    assert Path(paths[0]).read_text() == "Task prompt"
+    assert Path(args[1]).read_text() == "Task prompt"
 
 
 def test_system_prompt_file_write_failure_raises(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="Error writing system prompt"):
         asyncio.run(
-            _write_system_prompt_files(
+            _system_prompt_file_args(
                 LocalSandbox(),
                 ["--append-system-prompt", "Task prompt"],
                 None,
@@ -209,26 +208,10 @@ def test_system_prompt_file_write_failure_raises(tmp_path: Path) -> None:
         )
 
 
-def test_system_prompt_files_are_removed_after_the_agent_exits(
-    tmp_path: Path,
-) -> None:
-    sbox = LocalSandbox()
-    _, paths = asyncio.run(
-        _write_system_prompt_files(
-            sbox, ["--append-system-prompt", "Task prompt"], None, str(tmp_path)
-        )
-    )
-    asyncio.run(_remove_system_prompt_files(sbox, paths))
-
-    assert not Path(paths[0]).exists()
-
-
 def test_no_system_prompt_writes_no_files(tmp_path: Path) -> None:
     sbox = LocalSandbox()
-    args, paths = asyncio.run(_write_system_prompt_files(sbox, [], None, str(tmp_path)))
+    args = asyncio.run(_system_prompt_file_args(sbox, [], None, str(tmp_path)))
 
     assert args == []
-    assert paths == []
     assert list(tmp_path.iterdir()) == []
-    asyncio.run(_remove_system_prompt_files(sbox, paths))
     assert sbox.users == []

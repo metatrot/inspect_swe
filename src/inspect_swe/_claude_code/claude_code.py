@@ -4,6 +4,7 @@ from pathlib import Path
 from textwrap import dedent
 from typing import Any, Literal, Mapping, Sequence, cast
 
+import anyio
 from inspect_ai.agent import (
     Agent,
     AgentAttempts,
@@ -349,16 +350,6 @@ def claude_code(
             # resolve working directory (home dir if sandbox default is '/')
             agent_cwd = await resolve_agent_cwd(sbox, user, cwd)
 
-            # system prompts go in files rather than argv where the installed
-            # claude supports it (see _write_system_prompt_files)
-            system_prompt_dir = (
-                await sandbox_exec(sbox, "mktemp -d", user=user)
-                if await claude_code_supports_system_prompt_files(
-                    sbox, claude_binary, user
-                )
-                else None
-            )
-
             # install skills
             if resolved_skills is not None:
                 skills_dir = join_path(agent_cwd, ".claude/skills")
@@ -403,6 +394,13 @@ def claude_code(
                     "claude_code_attempt_count", lambda: attempt_count, 0
                 )
                 uncaught_error_count = 0
+                system_prompt_dir = (
+                    await sandbox_exec(sbox, "mktemp -d", user=user)
+                    if await claude_code_supports_system_prompt_files(
+                        sbox, claude_binary, user
+                    )
+                    else None
+                )
                 try:
                     while True:
                         is_resume = (
@@ -428,12 +426,8 @@ def claude_code(
                             replace_system_prompt,
                             is_resume=is_resume,
                         )
-                        system_prompt_files: list[str] = []
                         if system_prompt_dir is not None:
-                            (
-                                system_args,
-                                system_prompt_files,
-                            ) = await _write_system_prompt_files(
+                            system_args = await _system_prompt_file_args(
                                 sbox, system_args, user, system_prompt_dir
                             )
 
@@ -495,11 +489,6 @@ def claude_code(
                                     cc_debug.stderr.append(cc_event.data)
                             elif isinstance(cc_event, ExitEvent):
                                 exit_code = cc_event.code
-
-                        # the prompts have been read by now (the process has
-                        # exited) and they are the full system prompt, so don't
-                        # leave them sitting in the sandbox
-                        await _remove_system_prompt_files(sbox, system_prompt_files)
 
                         if debug:
                             debug_output.append(stderr_data)
@@ -570,6 +559,13 @@ def claude_code(
                     # raised inside the loop). Without this, the agent
                     # span tree leaks past the @agent boundary.
                     consumer.reset()
+                    if system_prompt_dir is not None:
+                        with anyio.CancelScope(shield=True):
+                            await sandbox_exec(
+                                sbox,
+                                f"rm -rf {shlex.quote(system_prompt_dir)}",
+                                user=user,
+                            )
 
                 # trace debug info
                 if debug:
@@ -597,14 +593,13 @@ def _system_prompt_args(
     return args
 
 
-async def _write_system_prompt_files(
+async def _system_prompt_file_args(
     sbox: Any,
     system_args: list[str],
     user: str | None,
     prompt_dir: str,
-) -> tuple[list[str], list[str]]:
+) -> list[str]:
     args: list[str] = []
-    paths: list[str] = []
     for flag, text in zip(system_args[::2], system_args[1::2], strict=True):
         path = join_path(prompt_dir, f"{uuid.uuid4().hex}.txt")
         result = await sbox.exec(
@@ -613,15 +608,8 @@ async def _write_system_prompt_files(
         if not result.success:
             raise RuntimeError(f"Error writing system prompt {path}: {result.stderr}")
         args.extend([f"{flag}-file", path])
-        paths.append(path)
 
-    return args, paths
-
-
-async def _remove_system_prompt_files(sbox: Any, paths: list[str]) -> None:
-    if paths:
-        quoted = " ".join(shlex.quote(path) for path in paths)
-        await sandbox_exec(sbox, f"rm -f {quoted}")
+    return args
 
 
 async def _seed_claude_config(
