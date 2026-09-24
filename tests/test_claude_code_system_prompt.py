@@ -1,11 +1,14 @@
 import asyncio
+import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
-from inspect_ai.util import SandboxEnvironment
+from inspect_ai.util import ExecResult, SandboxEnvironment
 from inspect_swe import claude_code
 from inspect_swe._claude_code.agentbinary import (
+    claude_code_binary_version,
     claude_code_supports_system_prompt_files,
 )
 from inspect_swe._claude_code.claude_code import (
@@ -15,21 +18,47 @@ from inspect_swe._claude_code.claude_code import (
 )
 
 
+class LocalSandbox:
+    def __init__(self) -> None:
+        self.users: list[str | None] = []
+
+    async def exec(
+        self,
+        cmd: list[str],
+        input: str | bytes | None = None,
+        user: str | None = None,
+        **kwargs: object,
+    ) -> ExecResult[str]:
+        self.users.append(user)
+        completed = subprocess.run(cmd, input=input, capture_output=True, text=True)
+        return ExecResult(
+            success=completed.returncode == 0,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+
+
+def fake_claude(tmp_path: Path, script: str) -> str:
+    binary = tmp_path / "claude"
+    binary.write_text(f"#!/bin/sh\n{script}\n")
+    binary.chmod(0o755)
+    return str(binary)
+
+
 class RecordingSandbox:
     """Minimal sandbox stand-in that records writes and shell commands."""
 
     async def write_file(self, file: str, contents: str) -> None:
         self.files[file] = contents
 
-    def __init__(self, help_output: str = "") -> None:
+    def __init__(self) -> None:
         self.files: dict[str, str] = {}
         self.execs: list[str] = []
-        self.help_output = help_output
 
     async def exec(self, cmd: list[str], **kwargs: object) -> object:
         self.execs.append(cmd[-1])
-        stdout = self.help_output if "--help" in cmd[-1] else ""
-        return SimpleNamespace(success=True, stdout=stdout, stderr="", returncode=0)
+        return SimpleNamespace(success=True, stdout="", stderr="", returncode=0)
 
 
 def test_system_prompt_appends_to_default() -> None:
@@ -83,41 +112,72 @@ def test_append_and_replace_system_prompts_are_mutually_exclusive() -> None:
         )
 
 
-# how 2.1.221 spells the flags in --help (it mentions rather than lists them)
-HELP_WITH_FILE_FLAGS = """  --append-system-prompt <prompt>       Append a system prompt to the default
-                                        via: --system-prompt[-file],
-                                        --append-system-prompt[-file], --add-dir
-"""
+def test_claude_code_binary_version_parses_the_version_line(tmp_path: Path) -> None:
+    binary = fake_claude(tmp_path, 'echo "2.1.221 (Claude Code)"')
+    version = asyncio.run(
+        claude_code_binary_version(cast(SandboxEnvironment, LocalSandbox()), binary)
+    )
+    assert version == (2, 1, 221)
 
-# the same section in 2.0.32, which rejects the flags as an unknown option
-HELP_WITHOUT_FILE_FLAGS = """  --append-system-prompt <prompt>       Append a system prompt to the default
+
+def test_claude_code_binary_version_probes_as_the_agent_user(tmp_path: Path) -> None:
+    binary = fake_claude(tmp_path, 'echo "2.1.221 (Claude Code)"')
+    sbox = LocalSandbox()
+    asyncio.run(
+        claude_code_binary_version(cast(SandboxEnvironment, sbox), binary, "agent")
+    )
+    assert sbox.users == ["agent"]
+
+
+def test_claude_code_binary_version_rejects_unparseable_output(
+    tmp_path: Path,
+) -> None:
+    binary = fake_claude(tmp_path, 'echo "Claude Code"')
+    with pytest.raises(RuntimeError, match="Unable to parse claude code version"):
+        asyncio.run(
+            claude_code_binary_version(cast(SandboxEnvironment, LocalSandbox()), binary)
+        )
+
+
+def test_claude_code_binary_version_raises_when_the_probe_fails(
+    tmp_path: Path,
+) -> None:
+    binary = fake_claude(tmp_path, "echo broken >&2; exit 1")
+    with pytest.raises(RuntimeError, match="broken"):
+        asyncio.run(
+            claude_code_binary_version(cast(SandboxEnvironment, LocalSandbox()), binary)
+        )
+
+
+HELP_HIDING_THE_FILE_FLAGS = """  --append-system-prompt <prompt>       Append a system prompt to the default
   --system-prompt <prompt>              System prompt to use for the session
 """
 
 
-def test_system_prompt_files_detected_from_help() -> None:
-    sbox = RecordingSandbox(HELP_WITH_FILE_FLAGS)
+def fake_claude_with_hidden_file_flags(tmp_path: Path, version: str) -> str:
+    return fake_claude(
+        tmp_path,
+        f'case "$1" in --version) echo "{version} (Claude Code)";; '
+        f"--help) cat <<'EOF'\n{HELP_HIDING_THE_FILE_FLAGS}EOF\n;; esac",
+    )
+
+
+def test_system_prompt_files_supported_from_2_0_33_even_when_help_hides_them(
+    tmp_path: Path,
+) -> None:
+    binary = fake_claude_with_hidden_file_flags(tmp_path, "2.0.33")
     assert asyncio.run(
         claude_code_supports_system_prompt_files(
-            cast(SandboxEnvironment, sbox), "claude"
+            cast(SandboxEnvironment, LocalSandbox()), binary
         )
     )
 
 
-def test_system_prompt_files_absent_from_older_help() -> None:
-    sbox = RecordingSandbox(HELP_WITHOUT_FILE_FLAGS)
+def test_system_prompt_files_unsupported_below_2_0_33(tmp_path: Path) -> None:
+    binary = fake_claude_with_hidden_file_flags(tmp_path, "2.0.32")
     assert not asyncio.run(
         claude_code_supports_system_prompt_files(
-            cast(SandboxEnvironment, sbox), "claude"
-        )
-    )
-
-
-def test_system_prompt_files_detected_when_help_lists_the_flag() -> None:
-    sbox = RecordingSandbox("  --append-system-prompt-file <file>\n")
-    assert asyncio.run(
-        claude_code_supports_system_prompt_files(
-            cast(SandboxEnvironment, sbox), "claude"
+            cast(SandboxEnvironment, LocalSandbox()), binary
         )
     )
 

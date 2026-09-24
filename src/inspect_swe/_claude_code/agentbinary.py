@@ -8,7 +8,9 @@ from typing_extensions import Literal
 from .._util.agentbinary import AgentBinarySource, AgentBinaryVersion
 from .._util.appdirs import package_cache_dir
 from .._util.download import download_text_file
-from .._util.sandbox import SandboxPlatform, bash_command
+from .._util.sandbox import SandboxPlatform, sandbox_exec
+
+SYSTEM_PROMPT_FILE_MIN_VERSION = (2, 0, 33)
 
 
 def claude_code_binary_source() -> AgentBinarySource:
@@ -41,31 +43,21 @@ def claude_code_binary_source() -> AgentBinarySource:
     )
 
 
+async def claude_code_binary_version(
+    sandbox: SandboxEnvironment, binary: str, user: str | None = None
+) -> tuple[int, int, int]:
+    output = await sandbox_exec(sandbox, f"{binary} --version", user=user)
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", output)
+    if match is None:
+        raise RuntimeError(f"Unable to parse claude code version from {output!r}")
+    return int(match[1]), int(match[2]), int(match[3])
+
+
 async def claude_code_supports_system_prompt_files(
     sandbox: SandboxEnvironment, binary: str, user: str | None = None
 ) -> bool:
-    """Whether an installed claude code accepts the --*-system-prompt-file flags.
-
-    Detected from ``claude --help`` rather than gated on a version number:
-    ``version="auto"`` and ``version="sandbox"`` run whatever binary is already
-    in the sandbox, so its version isn't always knowable, and detection also
-    holds for forks and backports. Returns ``False`` when ``--help`` can't be
-    run, which keeps the prompt on the command line as before.
-
-    ``--help`` currently spells the flags as an aside on ``--append-system-prompt``
-    (``--append-system-prompt[-file]``) rather than listing them, so match either
-    that or the bare flag.
-    """
-    result = await sandbox.exec(bash_command(f"{binary} --help"), user=user)
-    if not result.success:
-        return False
-    return any(
-        spelling in result.stdout
-        for spelling in (
-            "--append-system-prompt-file",
-            "--append-system-prompt[-file]",
-        )
-    )
+    version = await claude_code_binary_version(sandbox, binary, user)
+    return version >= SYSTEM_PROMPT_FILE_MIN_VERSION
 
 
 async def _claude_code_download_base_url() -> str:
