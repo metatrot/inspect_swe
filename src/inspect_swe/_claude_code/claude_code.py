@@ -505,6 +505,8 @@ def claude_code(
                             replace_system_prompt,
                             is_resume=is_resume,
                         )
+                        system_args = await _system_prompt_file_args(sbox, system_args)
+                        system_prompt_files = system_args[1::2]
 
                         # resume previous conversation
                         if is_resume:
@@ -568,6 +570,9 @@ def claude_code(
                         exit_code = 0
 
                         async for cc_event in claude_code_event_stream(proc):
+                            if system_prompt_files:
+                                await sbox.exec(["rm", "-f", *system_prompt_files])
+                                system_prompt_files = []
                             if isinstance(cc_event, JsonlEvent):
                                 consumer.process_jsonl_line(cc_event.raw)
                                 if cc_debug is not None:
@@ -678,6 +683,15 @@ def _system_prompt_args(
         args.extend(["--append-system-prompt", "\n\n".join(system_texts)])
 
     return args
+
+
+async def _system_prompt_file_args(sbox: Any, system_args: list[str]) -> list[str]:
+    file_args: list[str] = []
+    for flag, text in zip(system_args[::2], system_args[1::2], strict=True):
+        path = f"/tmp/claude{flag}-{uuid.uuid4().hex}"
+        await sbox.write_file(path, text)
+        file_args.extend([f"{flag}-file", path])
+    return file_args
 
 
 async def _seed_claude_config(
