@@ -512,14 +512,12 @@ def claude_code(
                                 [claude_binary, "--resume", session_id]
                                 + cmd
                                 + system_args
-                                + ["--", agent_prompt]
                             )
                         else:
                             agent_cmd = (
                                 [claude_binary, "--session-id", session_id]
                                 + cmd
                                 + system_args
-                                + ["--", agent_prompt]
                             )
 
                         # Fresh consumer state per attempt — agent-tree maps
@@ -550,10 +548,13 @@ def claude_code(
                         # launch Claude Code in streaming mode; drain stdout in
                         # real time so the consumer emits agent spans and the
                         # bridge resolver sees Task prompts as they appear.
+                        # The prompt goes on stdin, out of the process list and
+                        # past the 128 KiB argv entry limit; exec_remote closes
+                        # stdin after writing it, giving Claude Code its EOF.
                         proc = await sbox.exec_remote(
-                            cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
-                            + agent_cmd,
+                            cmd=agent_cmd,
                             options=ExecRemoteStreamingOptions(
+                                input=agent_prompt,
                                 cwd=agent_cwd,
                                 env=agent_env,
                                 user=user,
